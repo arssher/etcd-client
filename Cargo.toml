@@ -34,3 +34,8 @@ tonic-build = { version = "0.6.2", default-features = false, features = ["prost"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+
+[[bin]]
+name = "test"
+path = "examples/watch_bench.rs"

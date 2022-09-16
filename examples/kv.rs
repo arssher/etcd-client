@@ -1,117 +1,66 @@
 //! KV example.
 
+use std::time::Duration;
+
 use etcd_client::*;
+use tokio::time::sleep;
 
-#[derive(Debug)]
-struct KV {
-    key: String,
-    value: String,
-}
+const N: u32 = 100;
 
-impl KV {
-    #[inline]
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        KV {
-            key: key.into(),
-            value: value.into(),
+async fn pusher(mut client: Client) {
+    loop {
+        for i in 0..N {
+            let key = format!("key_{}", i);
+            let value = vec![0xFF; 1024];
+            client.put(key, value, None).await.unwrap();
         }
     }
+}
 
-    #[inline]
-    pub fn key(&self) -> &str {
-        &self.key
-    }
+async fn watcher(mut client: Client, i: u32) {
+    let key = format!("key_{}", i);
+    let (_watcher, mut stream) = client.watch(key, None).await.unwrap();
+    while let Some(resp) = stream.message().await.unwrap() {
+        println!("receive watch response");
 
-    #[inline]
-    pub fn value(&self) -> &str {
-        &self.value
+        if resp.canceled() {
+            println!("watch canceled!");
+            break;
+        }
+
+        for event in resp.events() {
+            println!("event type: {:?}", event.event_type());
+            if let Some(kv) = event.kv() {
+                println!(
+                    "kv: {{{}: {}}}",
+                    kv.key_str().unwrap(),
+                    kv.value_str().unwrap()
+                );
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let mut client = Client::connect(["localhost:2379"], None).await?;
+    let mut client = Client::connect(["localhost:2379"], None).await.unwrap();
+    let lease = client.lease_grant(10, None).await?;
+    let keys = 10000;
+    let workers = 10000;
+    let keys_in_worker = keys / workers;
 
-    let alice = KV::new("Alice", "15");
-    let bob = KV::new("Bob", "20");
-    let chris = KV::new("Chris", "16");
-
-    // put kv
-    let resp = client.put(alice.key(), alice.value(), None).await?;
-    println!("put kv: {:?}", alice);
-    let revison = resp.header().unwrap().revision();
-    client.put(bob.key(), bob.value(), None).await?;
-    println!("put kv: {:?}", bob);
-    client.put(chris.key(), chris.value(), None).await?;
-    println!("put kv: {:?}", chris);
-    println!();
-
-    // get kv
-    let resp = client.get(bob.key(), None).await?;
-    if let Some(kv) = resp.kvs().first() {
-        println!("Get kv: {{{}: {}}}", kv.key_str()?, kv.value_str()?);
-        println!();
+    let handles = (0..workers)
+        .map(|i| tokio::spawn(work(client.clone(), i, lease.id(), keys_in_worker)))
+        .collect::<Vec<_>>();
+    for h in handles {
+        h.await.unwrap().unwrap();
     }
 
-    // get all kv pairs
-    println!("Get all users:");
-    let resp = client
-        .get("", Some(GetOptions::new().with_all_keys()))
-        .await?;
-    for kv in resp.kvs() {
-        println!("\t{{{}: {}}}", kv.key_str()?, kv.value_str()?);
-    }
-    println!();
+    // for i in 0..keys {
+    // work(client.clone(), i, lease.id(), 1).await.unwrap();
+    // }
 
-    // delete kv
-    let resp = client
-        .delete(chris.key(), Some(DeleteOptions::new().with_prev_key()))
-        .await?;
-    if let Some(kv) = resp.prev_kvs().first() {
-        println!("Delete kv: {{{}: {}}}", kv.key_str()?, kv.value_str()?);
-        println!();
-    }
-
-    // transaction
-    let resp = client.get(alice.key(), None).await?;
-    if let Some(kv) = resp.kvs().first() {
-        println!(
-            "Before transaction: {{{}: {}}}",
-            kv.key_str()?,
-            kv.value_str()?
-        );
-    }
-    let txn = Txn::new()
-        .when(vec![Compare::value(
-            alice.key(),
-            CompareOp::Equal,
-            alice.value(),
-        )])
-        .and_then(vec![TxnOp::put(
-            alice.key(),
-            "18",
-            Some(PutOptions::new().with_ignore_lease()),
-        )]);
-    println!("transaction: {:?}", txn);
-    let resp = client.txn(txn).await?;
-    for op_resp in resp.op_responses() {
-        println!("transaction resp: {:?}", op_resp);
-    }
-    let resp = client.get(alice.key(), None).await?;
-    if let Some(kv) = resp.kvs().first() {
-        println!(
-            "After transaction: {{{}: {}}}",
-            kv.key_str()?,
-            kv.value_str()?
-        );
-    }
-    println!();
-
-    // compact
-    client
-        .compact(revison, Some(CompactionOptions::new().with_physical()))
-        .await?;
-    println!("Compact to revision {}.", revison);
+    // println!("inserted");
 
     Ok(())
 }
